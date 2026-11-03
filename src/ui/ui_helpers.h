@@ -1,0 +1,54 @@
+
+#ifndef UI_HELPERS_H
+#define UI_HELPERS_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include "lvgl.h"
+
+// ---- fonts from the LCD Wizard library (src/ui/fonts/) ----
+LV_FONT_DECLARE(ui_font_roboto_mono_12);
+LV_FONT_DECLARE(ui_font_roboto_mono_14);
+LV_FONT_DECLARE(ui_font_roboto_mono_16);
+LV_FONT_DECLARE(ui_font_roboto_mono_bold_14);
+
+// ---- icons from the LCD Wizard icon library (src/ui/fonts/) ----
+// Show one on a label whose font is a ui_font_icons_<size> that has it:
+//   lv_label_set_text(label, UI_ICON_...);
+LV_FONT_DECLARE(ui_font_icons_20);
+LV_FONT_DECLARE(ui_font_icons_32);
+
+#define UI_ICON_BLUETOOTH           "\xEE\x80\x80"   /* Bluetooth */
+#define UI_ICON_BLUETOOTH_AUDIO     "\xEE\x80\x81"   /* Bluetooth audio */
+
+#define _UI_MODIFY_FLAG_ADD    0
+#define _UI_MODIFY_FLAG_REMOVE 1
+#define _UI_MODIFY_FLAG_TOGGLE 2
+
+void _ui_flag_modify(lv_obj_t * target, int32_t flag, int value);
+void _ui_screen_change(lv_obj_t ** target, lv_scr_load_anim_t fademode, int spd, int delay, void (*target_init)(void));
+void _ui_screen_delete(lv_obj_t ** target);
+#if LV_USE_ARC
+void _ui_arc_increment(lv_obj_t * target, int val);
+void _ui_arc_set_text_value(lv_obj_t * trg, lv_obj_t * src, const char * prefix, const char * postfix);
+#endif
+#if LV_USE_SLIDER
+void _ui_slider_increment(lv_obj_t * target, int val, lv_anim_enable_t anm);
+void _ui_slider_set_text_value(lv_obj_t * trg, lv_obj_t * src, const char * prefix, const char * postfix);
+#endif
+#if LV_USE_BAR
+void _ui_bar_increment(lv_obj_t * target, int val, lv_anim_enable_t anm);
+#endif
+void _ui_checked_set_text_value(lv_obj_t * trg, lv_obj_t * src, const char * txt_on, const char * txt_off);
+void _ui_switch_theme(bool dark);
+void _ui_anim_callback_set_opacity(void * obj, int32_t v);
+void _ui_anim_callback_set_zoom(void * obj, int32_t v);
+void _ui_anim_callback_set_angle(void * obj, int32_t v);
+
+#ifdef __cplusplus
+} /*extern "C"*/
+#endif
+
+#endif
