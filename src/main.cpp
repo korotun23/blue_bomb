@@ -1,5 +1,5 @@
 // App layer
-// Link between Bluetooth (BLE + Classic) and the interface
+// Link between Bluetooth (BLE + Classic), the nRF24 spectrum analyzer and the interface (ui_app)
 //
 // Mode inventaire : les cycles BLE puis classique s'enchaînent jusqu'à l'appui sur Stop.
 // La liste est cumulative ; un appareil non vu depuis STALE_MS est grisé, et c'est le
@@ -8,8 +8,9 @@
 #include <Arduino.h>
 
 #include <drivers/display_driver.h>
-#include <ui/ui.h>
+#include <ui_app/ui_app.h>
 #include <scanners/bluetooth/bt_scanner.h>
+#include <scanners/nrf24/nrf24_scanner.h>
 #include <utilities/company_ids.h>
 
 #define BT_QUEUE_LENGTH        64
@@ -26,6 +27,20 @@ static QueueHandle_t btQueue = nullptr;
 static BtScanner     btScanner;
 
 // ---------------------------------------------------------------------------
+//  Analyseur de spectre (modules nRF24L01+)
+//  Les barres affichées gardent la valeur la plus haute récente et retombent lentement
+//  ("max hold" avec décroissance) : une activité brève (annonce BLE, paquet Wi-Fi) reste visible.
+// ---------------------------------------------------------------------------
+#define SPEC_DECAY_PER_FRAME  6        // points de % perdus par trame (250 ms) : environ 24 %/s
+
+static_assert(UI_SPEC_CHANNELS == SPEC_CHANNELS, "ui.h et nrf24_scanner.h doivent avoir le meme nombre de canaux");
+
+static QueueHandle_t   specQueue = nullptr;
+static SpectrumScanner spectrum;
+static bool            specWanted = false;    // vue ouverte et pas en pause : le balayage doit tourner
+static uint8_t         specShown[SPEC_CHANNELS];
+
+// ---------------------------------------------------------------------------
 //  Table des périphériques
 //  Un même périphérique envoie plusieurs messages (annonce puis scan response,
 //  résultat d'inquiry puis nom...) : on les fusionne ici, par adresse.
@@ -35,7 +50,8 @@ static BtScanner     btScanner;
 struct DeviceRow {
     BtDeviceInfo info;       // données fusionnées de tous les messages reçus
     char     key[20];        // type + adresse
-    char     label[40];      // texte affiché dans la liste
+    char     label[40];      // ligne "Name" de la liste
+    char     sub[48];        // ligne "UUID" de la liste
     uint8_t  quality;        // qualité du libellé : on ne le remplace que par mieux
     int8_t   shownRssi;      // RSSI actuellement affiché dans la liste
     bool     stale;          // ligne actuellement grisée
@@ -151,23 +167,23 @@ static const char *ble_addr_type_name(uint8_t t)
 
 // Choisit le texte de la liste et retourne sa qualité (plus c'est haut, mieux c'est) :
 //   5 nom, 4 constructeur connu, 3 classe d'appareil (classique), 2 identifiant brut, 1 adresse
-// Le texte est tronqué à 15 caractères pour que le RSSI reste visible sur la ligne.
+// Le nom est tronqué à 18 caractères : la ligne "Name" de la liste en affiche une vingtaine.
 static uint8_t make_label(const BtDeviceInfo &d, char *out, size_t size)
 {
     const char *tag = (d.type == BT_TYPE_CLASSIC) ? "BT" : "LE";
 
     if (d.name[0]) {
-        snprintf(out, size, "%s %.15s", tag, d.name);
+        snprintf(out, size, "%s %.18s", tag, d.name);
         return 5;
     }
     const char *vendor = d.hasCompany ? companyName(d.companyId) : nullptr;
     if (vendor) {
-        snprintf(out, size, "%s %.15s", tag, vendor);
+        snprintf(out, size, "%s %.18s", tag, vendor);
         return 4;
     }
     const char *cls = d.cod ? cod_major_name(d.cod) : nullptr;
     if (cls) {
-        snprintf(out, size, "%s %.15s", tag, cls);
+        snprintf(out, size, "%s %.18s", tag, cls);
         return 3;
     }
     if (d.hasCompany) {
@@ -176,6 +192,13 @@ static uint8_t make_label(const BtDeviceInfo &d, char *out, size_t size)
     }
     snprintf(out, size, "%s %s", tag, d.address);
     return 1;
+}
+
+// Ligne "UUID" de la liste : services annoncés (BLE) ; le classique n'en annonce pas
+static void make_sub(const BtDeviceInfo &d, char *out, size_t size)
+{
+    if (d.type == BT_TYPE_BLE) ble_services_text(d, out, size);
+    else                       snprintf(out, size, "-");
 }
 
 // ------------------------------------------------------------ page de détail
@@ -289,13 +312,12 @@ static int find_evictable()
     return best;
 }
 
-// Supprime une ligne : les suivantes remontent, il faut donc les renuméroter
+// Supprime une ligne : les suivantes remontent (les lignes ne sont plus numérotées à l'écran)
 static void remove_row(int idx)
 {
     ui_remove_device(idx);
     memmove(&rows[idx], &rows[idx + 1], (rowCount - idx - 1) * sizeof(DeviceRow));
     rowCount--;
-    for (int j = idx; j < rowCount; j++) ui_update_device(j, rows[j].label, rows[j].shownRssi);
 }
 
 static void handle_device(const BtDeviceInfo &d)
@@ -323,9 +345,10 @@ static void handle_device(const BtDeviceInfo &d)
         r.lastSeen  = now;
         r.shownRssi = d.hasRssi ? d.rssi : 0;        // 0 = inconnu, la ligne affichera "--"
         r.quality   = make_label(r.info, r.label, sizeof(r.label));
+        make_sub(r.info, r.sub, sizeof(r.sub));
         snprintf(r.key, sizeof(r.key), "%s", key);
 
-        if (!ui_add_device(r.label, r.shownRssi)) return;
+        if (!ui_add_device(r.label, r.sub, r.shownRssi)) return;
         rowCount++;
         return;
     }
@@ -350,11 +373,17 @@ static void handle_device(const BtDeviceInfo &d)
         r.quality = quality;
         changed = true;
     }
+    char sub[48];
+    make_sub(r.info, sub, sizeof(sub));
+    if (strcmp(sub, r.sub) != 0) {                   // de nouveaux services ont été annoncés
+        snprintf(r.sub, sizeof(r.sub), "%s", sub);
+        changed = true;
+    }
     if (r.info.hasRssi && (r.shownRssi == 0 || abs((int)r.info.rssi - (int)r.shownRssi) >= RSSI_UI_STEP)) {
         r.shownRssi = r.info.rssi;
         changed = true;
     }
-    if (changed) ui_update_device(idx, r.label, r.shownRssi);
+    if (changed) ui_update_device(idx, r.label, r.sub, r.shownRssi);
 }
 
 // Vide la queue : QUEUE_BATCH messages maximum par passage pour ne pas bloquer LVGL
@@ -395,8 +424,11 @@ static void service_tick()
 // ------------------------------------------------------------ scan
 
 // Bouton Start / Stop
+static bool btReady = false;                         // pile Bluetooth initialisée
+
 static void on_scan_button()
 {
+    Serial.println("[ui] appui sur Start / Stop scan");
     if (btScanner.isStopping()) return;
 
     if (btScanner.isScanning()) {                    // Stop
@@ -404,7 +436,21 @@ static void on_scan_button()
         return;
     }
 
+    // Start : si la pile Bluetooth n'a pas démarré au boot (mémoire...), on réessaie une fois ici
+    if (!btReady) {
+        Serial.printf("[bt] pile non initialisee, nouvelle tentative (heap libre %u octets)\n", (unsigned)ESP.getFreeHeap());
+        btReady = btScanner.begin(btQueue);
+        if (!btReady) {
+            Serial.println("[bt] echec : voir la ligne \"BT: ... ->\" ci-dessus pour l'etape en cause");
+            ui_set_scan_state(UI_SCAN_ERROR, 0);
+            return;
+        }
+        Serial.println("[bt] pile initialisee");
+    }
+
     // Start : nouvelle session, on repart d'une liste vide
+    specWanted = false;                              // jamais d'analyse radio pendant un scan Bluetooth
+    spectrum.stop();
     xQueueReset(btQueue);
     rowCount       = 0;
     detailIndex    = -1;
@@ -441,6 +487,74 @@ static void update_scan_state()
     lastCycle = cycle;
 }
 
+// ------------------------------------------------------------ spectre
+
+static void spec_show_message(const char *line1, const char *line2)
+{
+    memset(specShown, 0, sizeof(specShown));
+    ui_spectrum_update(specShown, line1, line2);
+}
+
+// Événements de la vue spectre
+static void on_spectrum_event(UiSpectrumEvent ev)
+{
+    switch (ev) {
+    case UI_SPEC_OPENED:
+        if (spectrum.modules() == 0) {
+            specWanted = false;
+            ui_spectrum_set_running(false);
+            spec_show_message("No nRF24 module detected", "Check wiring (nrf24_scanner.h)");
+            break;
+        }
+        // Le scan Bluetooth de l'ESP32 émet (requêtes de scan, inquiry) : les modules le verraient
+        // comme une activité parasite, et les deux se disputent le processeur. On l'arrête.
+        if (btScanner.isScanning()) btScanner.stopScan();
+        specWanted = true;
+        ui_spectrum_set_running(true);
+        spec_show_message("Starting...", "");
+        break;
+
+    case UI_SPEC_CLOSED:
+        specWanted = false;
+        spectrum.stop();
+        break;
+
+    case UI_SPEC_TOGGLE:
+        if (spectrum.modules() == 0) break;
+        specWanted = !specWanted;                    // Pause / reprise
+        ui_spectrum_set_running(specWanted);
+        break;
+    }
+}
+
+// Démarre ou arrête le balayage selon la vue, et affiche la dernière trame reçue
+static void service_spectrum()
+{
+    if (specWanted && !spectrum.running()) {
+        if (!btScanner.isScanning()) spectrum.start();    // on attend l'arrêt effectif du scan Bluetooth
+    } else if (!specWanted && spectrum.running()) {
+        spectrum.stop();
+    }
+
+    SpectrumFrame f;
+    if (xQueueReceive(specQueue, &f, 0) != pdTRUE) return;
+    if (!specWanted || !ui_spectrum_visible()) return;    // trame tardive (pause, retour à la liste)
+
+    uint8_t maxLevel = 0;
+    int     maxCh    = 0;
+    for (int i = 0; i < SPEC_CHANNELS; i++) {
+        uint8_t held = specShown[i] > SPEC_DECAY_PER_FRAME ? specShown[i] - SPEC_DECAY_PER_FRAME : 0;
+        specShown[i] = f.level[i] > held ? f.level[i] : held;
+        if (f.level[i] > maxLevel) { maxLevel = f.level[i]; maxCh = i; }
+    }
+
+    char l1[48], l2[48];
+    if (maxLevel == 0) snprintf(l1, sizeof(l1), "No activity above threshold");
+    else               snprintf(l1, sizeof(l1), "Peak %u MHz  %u%%", 2400 + maxCh, (unsigned)maxLevel);
+    snprintf(l2, sizeof(l2), "%u sweeps/s  %u module(s)", (unsigned)f.sweepsPerSec, (unsigned)f.modules);
+    ui_spectrum_update(specShown, l1, l2);
+}
+
 void setup()
 {
     Serial.begin(115200);
@@ -453,15 +567,21 @@ void setup()
     }
 
     display_init();
-    ui_init();
+    ui_app_init();
     ui_set_scan_handler(on_scan_button);
     ui_set_device_handler(on_device_selected);
+    ui_set_spectrum_handler(on_spectrum_event);
 
     Serial.printf("Heap avant Bluetooth : %u octets\n", (unsigned)ESP.getFreeHeap());
-    if (!btScanner.begin(btQueue)) {
-        Serial.println("ERREUR : initialisation Bluetooth impossible");
+    btReady = btScanner.begin(btQueue);
+    if (!btReady) {
+        Serial.println("ERREUR : initialisation Bluetooth impossible (le bouton Start scan réessaiera)");
     }
     Serial.printf("Heap apres Bluetooth : %u octets\n", (unsigned)ESP.getFreeHeap());
+
+    specQueue = xQueueCreate(1, sizeof(SpectrumFrame));    // longueur 1 : seule la dernière trame compte
+    uint8_t nrfModules = spectrum.begin(specQueue);
+    Serial.printf("nRF24 : %u module(s) detecte(s)\n", (unsigned)nrfModules);
 
     Serial.println("Setup complete.");
 }
@@ -469,6 +589,7 @@ void setup()
 void loop()
 {
     process_bt_queue();
+    service_spectrum();
     service_tick();
     update_scan_state();
     display_update();

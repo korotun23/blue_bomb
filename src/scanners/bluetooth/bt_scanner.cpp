@@ -3,8 +3,20 @@
 #include <string.h>
 #include <stdio.h>
 
-#include <esp32-hal-bt.h>   // btStart() : garde la mémoire du contrôleur Bluetooth (cf. btInUse)
+#include <esp32-hal-bt.h>   // btStart()
+
+// Le cœur Arduino libère au démarrage la mémoire du contrôleur Bluetooth (BLE et/ou classique) quand
+// rien ne déclare s'en servir ; esp_bt_controller_init() échoue ensuite avec ESP_ERR_INVALID_STATE.
+//  - cœur Arduino-ESP32 3.3 et plus récents : ces deux en-têtes déclarent l'usage du BLE et du classique ;
+//  - cœurs plus anciens : l'appel à btStart() ci-dessous suffit (ils n'ont pas ces en-têtes).
+#if __has_include(<esp32-hal-alloc-ble-mem.h>)
+#include <esp32-hal-alloc-ble-mem.h>
+#endif
+#if __has_include(<esp32-hal-alloc-bt-classic-mem.h>)
+#include <esp32-hal-alloc-bt-classic-mem.h>
+#endif
 #include <esp_bt.h>
+#include <esp_heap_caps.h>
 #include <esp_bt_main.h>
 #include <esp_gap_ble_api.h>
 #include <esp_gap_bt_api.h>
@@ -284,9 +296,16 @@ bool BtScanner::begin(QueueHandle_t queue)
 {
     s_queue = queue;
 
-    if (!btStart()) {
-        Serial.println("BT: btStart() a echoue");
-        return false;
+    // btStart() initialise ET active le contrôleur. On ne l'appelle que si le contrôleur est au repos :
+    // après un échec partiel (contrôleur initialisé mais pas activé), le rappeler renvoie
+    // ESP_ERR_INVALID_STATE et masque la vraie cause ; les étapes ci-dessous reprennent là où on s'est arrêté.
+    if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_IDLE) {
+        if (!btStart()) {
+            Serial.printf("BT: btStart() a echoue (etat controleur %d, heap libre %u, plus grand bloc %u)\n",
+                          (int)esp_bt_controller_get_status(), (unsigned)ESP.getFreeHeap(),
+                          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+            return false;
+        }
     }
 
     if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_IDLE) {
